@@ -121,6 +121,22 @@ def prs_needing_review(repo: str | None, all_repos: bool) -> list[dict]:
     return run_gh_json(args)  # type: ignore[return-value]
 
 
+def other_open_prs(repo: str | None, exclude_numbers: set[int]) -> list[dict]:
+    """Every remaining open PR in `repo` that is neither authored by you nor
+    currently requesting your review.
+
+    Only meaningful for a single repository (enumerating every open PR
+    across every repo you can see isn't practical): returns an empty list
+    in --all-repos mode, where `repo` is None.
+    """
+    if repo is None:
+        return []
+    prs = run_gh_json(
+        ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,url,author"]
+    )
+    return [pr for pr in prs if pr["number"] not in exclude_numbers]  # type: ignore[return-value,operator]
+
+
 def review_thread_and_request_status(
     owner: str, name: str, number: int
 ) -> tuple[int, list[str], list[str]]:
@@ -315,11 +331,22 @@ def print_review_requests(prs: list[dict], repo: str | None) -> bool:
     return any_actionable
 
 
+def print_other_prs(prs: list[dict], repo: str | None) -> None:
+    print("\n=== Other open PRs (not yours, not awaiting your review) ===")
+    if not prs:
+        print("  (none)")
+        return
+    for pr in prs:
+        author = pr.get("author", {}).get("login", "unknown")
+        print(f"  - #{pr['number']} {pr['title']} by @{author} ({pr['url']})")
+
+
 def build_json_report(
     user: str,
     repo: str | None,
     pr_issues: list[PrIssues],
     review_requests: list[dict],
+    other_prs: list[dict],
 ) -> dict:
     has_own_issues = any(issues.has_issues for issues in pr_issues)
     review_request_entries = [
@@ -333,6 +360,16 @@ def build_json_report(
         }
         for pr in review_requests
     ]
+    other_pr_entries = [
+        {
+            "number": pr["number"],
+            "title": pr["title"],
+            "url": pr["url"],
+            "repo": repo,
+            "author": pr.get("author", {}).get("login", "unknown"),
+        }
+        for pr in other_prs
+    ]
     has_actionable_review_requests = any(
         not entry["is_release_bump"] for entry in review_request_entries
     )
@@ -341,9 +378,11 @@ def build_json_report(
         "repo": repo,
         "own_prs": [issues.to_json() for issues in pr_issues],
         "review_requests": review_request_entries,
+        "other_prs": other_pr_entries,
         "own_pr_count": len(pr_issues),
         "review_request_count": len(review_request_entries),
-        "total_pr_count": len(pr_issues) + len(review_request_entries),
+        "other_pr_count": len(other_pr_entries),
+        "total_pr_count": len(pr_issues) + len(review_request_entries) + len(other_pr_entries),
         "has_own_issues": has_own_issues,
         "has_review_requests": bool(review_requests),
         "has_actionable_review_requests": has_actionable_review_requests,
@@ -374,19 +413,25 @@ def main() -> int:
 
     pr_issues = gather_own_pr_issues(repo, args.all_repos)
     review_requests = prs_needing_review(repo, args.all_repos)
+    exclude_numbers = {issues.number for issues in pr_issues} | {pr["number"] for pr in review_requests}
+    other_prs = other_open_prs(repo, exclude_numbers)
 
     if args.json:
-        report = build_json_report(user, repo, pr_issues, review_requests)
+        report = build_json_report(user, repo, pr_issues, review_requests, other_prs)
         print(json.dumps(report, indent=2))
         return 0 if report["clean"] else 1
 
     print(f"Checking outstanding GitHub work for @{user}" + (f" in {repo}" if repo else " across all repos"))
-    total_prs = len(pr_issues) + len(review_requests)
-    print(f"Total of {total_prs} PR(s): {len(pr_issues)} yours, {len(review_requests)} awaiting your review")
+    total_prs = len(pr_issues) + len(review_requests) + len(other_prs)
+    print(
+        f"Total of {total_prs} PR(s): {len(pr_issues)} yours, "
+        f"{len(review_requests)} awaiting your review, {len(other_prs)} other"
+    )
     print()
 
     has_own_issues = print_own_pr_report(pr_issues, args.all_repos)
     has_actionable_review_requests = print_review_requests(review_requests, repo)
+    print_other_prs(other_prs, repo)
 
     if not has_own_issues and not has_actionable_review_requests:
         print("\nNothing outstanding. You're all caught up!")
