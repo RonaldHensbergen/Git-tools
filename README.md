@@ -75,3 +75,24 @@ authenticated (`gh auth status`).
 The summary table shows open/closed/total counts and completion percentage
 per date and milestone; each dated section lists issues as a Markdown
 checklist (checked when closed), with assignees and labels.
+
+### `list_python_on_path.py`
+
+Scans every directory on `$PATH` and lists the Python scripts it finds,
+whether they're a plain file or a symlink (e.g. the tools in this repo,
+which are exposed via symlinks under `~/.local/bin`), and flags any broken
+symlinks. A script is recognized either by its `.py` extension or, for
+extensionless files, by inspecting its shebang line for `python`.
+
+```sh
+# List every Python script found on PATH
+./list_python_on_path.py
+
+# Only show broken symlinks (dangling targets)
+./list_python_on_path.py --broken-only
+
+# Emit a machine-readable JSON report instead of text
+./list_python_on_path.py --json
+```
+
+Exits non-zero when a broken Python-looking symlink is found on PATH.
