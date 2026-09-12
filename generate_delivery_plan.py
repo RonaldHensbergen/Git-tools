@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,17 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 
 GH_EXECUTABLE = shutil.which("gh") or "gh"
+
+# Matches phrases like "Depends on #12", "blocked by #34", "requires #5" in an
+# issue body, so we can tell which of two issues should be resolved first.
+DEPENDENCY_PATTERN = re.compile(r"(?:depends on|blocked by|requires)\s*#(\d+)", re.IGNORECASE)
+
+
+def extract_dependencies(body: str | None) -> list[int]:
+    """Return the issue numbers that `body` says this issue depends on."""
+    if not body:
+        return []
+    return [int(match) for match in DEPENDENCY_PATTERN.findall(body)]
 
 
 def run_gh(args: list[str]) -> str:
@@ -80,16 +92,35 @@ class Issue:
     assignees: list[str]
     labels: list[str]
     milestone_title: str | None
+    depends_on: list[int] = field(default_factory=list)
+    # GitHub's native sub-issues feature: an umbrella/epic issue tracks these
+    # as its children, and isn't done until they are. Populated from the
+    # `sub_issues_summary`/`/sub_issues` API, on top of any `depends_on`
+    # parsed from the issue body.
+    sub_issues: list[int] = field(default_factory=list)
+    sub_issues_total: int = 0
+    sub_issues_completed: int = 0
 
     @property
     def is_closed(self) -> bool:
         return self.state.upper() == "CLOSED"
 
+    @property
+    def is_umbrella(self) -> bool:
+        return self.sub_issues_total > 0
+
     def checklist_line(self) -> str:
         box = "x" if self.is_closed else " "
         who = f" ({', '.join(self.assignees)})" if self.assignees else ""
         tags = f" [{', '.join(self.labels)}]" if self.labels else ""
-        return f"- [{box}] #{self.number} {self.title}{who}{tags} ({self.url})"
+        umbrella = (
+            f" 🗂️ umbrella issue ({self.sub_issues_completed}/{self.sub_issues_total} sub-issues done"
+            + (f": {', '.join(f'#{n}' for n in self.sub_issues)}" if self.sub_issues else "")
+            + ")"
+            if self.is_umbrella
+            else ""
+        )
+        return f"- [{box}] #{self.number} {self.title}{who}{tags}{umbrella} ({self.url})"
 
 
 def fetch_milestones(repo: str) -> list[Milestone]:
@@ -106,45 +137,47 @@ def fetch_milestones(repo: str) -> list[Milestone]:
 
 def parse_issue_json(raw: dict) -> Issue:
     milestone = raw.get("milestone")
+    sub_issues_summary = raw.get("sub_issues_summary") or {}
     return Issue(
         number=raw["number"],
         title=raw["title"],
-        url=raw["url"],
+        url=raw.get("html_url") or raw["url"],
         state=raw["state"],
         assignees=[a["login"] for a in raw.get("assignees", [])],
         labels=[label["name"] for label in raw.get("labels", [])],
         milestone_title=milestone["title"] if milestone else None,
+        depends_on=extract_dependencies(raw.get("body")),
+        sub_issues_total=sub_issues_summary.get("total", 0),
+        sub_issues_completed=sub_issues_summary.get("completed", 0),
     )
 
 
-ISSUE_FIELDS = "number,title,url,state,assignees,labels,milestone"
-
-
-def fetch_issues_for_milestone(repo: str, title: str, state: str) -> list[Issue]:
+def fetch_issues_for_milestone(repo: str, milestone: Milestone, state: str) -> list[Issue]:
+    # The REST issues endpoint (unlike `gh issue list --json`) exposes
+    # `sub_issues_summary`, which is how we detect umbrella/epic issues.
     raw = run_gh_json(
         [
-            "issue",
-            "list",
-            "--repo",
-            repo,
-            "--milestone",
-            title,
-            "--state",
-            state,
-            "--json",
-            ISSUE_FIELDS,
-            "--limit",
-            "500",
+            "api",
+            f"repos/{repo}/issues?milestone={milestone.number}&state={state}&per_page=100",
+            "--paginate",
         ]
     )
-    return [parse_issue_json(item) for item in raw]  # type: ignore[union-attr]
+    return [
+        parse_issue_json(item)
+        for item in raw  # type: ignore[union-attr]
+        if not item.get("pull_request")
+    ]
 
 
 def fetch_issue(repo: str, number: int) -> Issue:
-    raw = run_gh_json(
-        ["issue", "view", str(number), "--repo", repo, "--json", ISSUE_FIELDS]
-    )
+    raw = run_gh_json(["api", f"repos/{repo}/issues/{number}"])
     return parse_issue_json(raw)  # type: ignore[arg-type]
+
+
+def fetch_sub_issue_numbers(repo: str, number: int) -> list[int]:
+    """Return the issue numbers GitHub's native sub-issues feature lists as children of `number`."""
+    raw = run_gh_json(["api", f"repos/{repo}/issues/{number}/sub_issues", "--paginate"])
+    return [item["number"] for item in raw]  # type: ignore[union-attr]
 
 
 def gather_issues(
@@ -152,11 +185,21 @@ def gather_issues(
 ) -> list[Issue]:
     issues: dict[int, Issue] = {}
     for milestone in milestones:
-        for issue in fetch_issues_for_milestone(repo, milestone.title, state):
+        for issue in fetch_issues_for_milestone(repo, milestone, state):
             issues[issue.number] = issue
     for number in explicit_numbers:
         if number not in issues:
             issues[number] = fetch_issue(repo, number)
+
+    # An umbrella issue depends on its sub-issues (they must resolve first),
+    # in addition to any dependency parsed from the issue body.
+    for issue in issues.values():
+        if issue.is_umbrella:
+            issue.sub_issues = fetch_sub_issue_numbers(repo, issue.number)
+            for sub_number in issue.sub_issues:
+                if sub_number not in issue.depends_on:
+                    issue.depends_on.append(sub_number)
+
     return list(issues.values())
 
 
@@ -221,6 +264,37 @@ def filter_groups_by_range(
     return sorted(result, key=lambda g: g.sort_key)
 
 
+def order_by_dependencies(issues: list[Issue]) -> list[Issue]:
+    """Order issues so that each one appears after any issue it depends on.
+
+    Dependencies come from `Issue.depends_on` (parsed from phrases like
+    "Depends on #12" in the issue body). Issues without a dependency
+    relationship keep their original (numeric) relative order. Dependencies
+    on issues outside of `issues`, or dependency cycles, are ignored rather
+    than raising an error.
+    """
+    by_number = {issue.number: issue for issue in issues}
+    visited: set[int] = set()
+    in_progress: set[int] = set()
+    ordered: list[Issue] = []
+
+    def visit(issue: Issue) -> None:
+        if issue.number in visited or issue.number in in_progress:
+            return
+        in_progress.add(issue.number)
+        for dep_number in sorted(issue.depends_on):
+            dependency = by_number.get(dep_number)
+            if dependency is not None:
+                visit(dependency)
+        in_progress.discard(issue.number)
+        visited.add(issue.number)
+        ordered.append(issue)
+
+    for issue in sorted(issues, key=lambda i: i.number):
+        visit(issue)
+    return ordered
+
+
 def render_markdown(title: str, repo: str, groups: list[DateGroup]) -> str:
     lines = [f"# {title}", "", f"Repository: `{repo}`", f"Generated: {datetime.now().isoformat(timespec='seconds')}", ""]
 
@@ -250,7 +324,7 @@ def render_markdown(title: str, repo: str, groups: list[DateGroup]) -> str:
         for milestone_title, milestone_issues in sorted(group.milestones.items()):
             lines.append(f"### {milestone_title}")
             lines.append("")
-            for issue in sorted(milestone_issues, key=lambda i: i.number):
+            for issue in order_by_dependencies(milestone_issues):
                 lines.append(issue.checklist_line())
             lines.append("")
 

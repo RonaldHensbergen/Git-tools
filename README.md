@@ -76,6 +76,12 @@ The summary table shows open/closed/total counts and completion percentage
 per date and milestone; each dated section lists issues as a Markdown
 checklist (checked when closed), with assignees and labels.
 
+Issues within each milestone are ordered so dependencies come first: an
+umbrella/epic issue (detected via GitHub's native sub-issues feature) is
+listed after its sub-issues and shows their completion progress, and any
+issue whose body says "depends on #N" / "blocked by #N" / "requires #N" is
+listed after #N.
+
 ### `list_python_on_path.py`
 
 Scans every directory on `$PATH` and lists the Python scripts it finds,
@@ -96,3 +102,39 @@ extensionless files, by inspecting its shebang line for `python`.
 ```
 
 Exits non-zero when a broken Python-looking symlink is found on PATH.
+
+### `prune-local-branches.sh`
+
+Deletes local branches that no longer exist on a remote. Fetches and prunes
+the remote first, then walks every local branch (skipping the one currently
+checked out) and prompts for confirmation before deleting each one that has
+no matching remote branch. Falls back to a force delete (`git branch -D`) if
+a normal delete is rejected (e.g. unmerged changes).
+
+```sh
+# Prune against 'origin' (default)
+./prune-local-branches.sh
+
+# Prune against a different remote
+./prune-local-branches.sh upstream
+```
+
+### `prune-remote-branches.sh`
+
+Deletes remote branches that have no local counterpart and no associated
+pull request (open or closed). Uses `gh repo view` to determine the repo and
+default branch, and `gh pr list --head` to check for a PR before proposing a
+branch for deletion; the default branch is always skipped. Lists every
+candidate branch and asks for a single confirmation before deleting them
+all.
+
+```sh
+# Prune 'origin' (default)
+./prune-remote-branches.sh
+
+# Prune a different remote
+./prune-remote-branches.sh upstream
+```
+
+Requires the [GitHub CLI](https://cli.github.com/) (`gh`) to be installed and
+authenticated (`gh auth status`).
